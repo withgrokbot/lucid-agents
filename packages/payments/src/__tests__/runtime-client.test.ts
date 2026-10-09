@@ -10,6 +10,8 @@ import type {
   WalletsRuntime,
 } from '@lucid-agents/types/wallets';
 
+import { encodePaymentRequiredHeader } from '@x402/core/http';
+
 import { createRuntimePaymentContext } from '../runtime';
 
 type PaymentClientRuntime = NonNullable<
@@ -266,6 +268,50 @@ describe('runtime payment client context', () => {
     ).toBe('0xdeadbeef');
     expect(signChallenge).toHaveBeenCalledTimes(1);
     expect(context.signer?.address).toBe(UPDATED_ADDRESS);
+  });
+
+  it('applies beforePayment even without policy groups', async () => {
+    const beforePayment = mock(async () => ({
+      allowed: false,
+      reason: 'blocked',
+    }));
+    const context = await createRuntimePaymentContext({
+      runtime: runtimeWithConnector(
+        {},
+        {
+          paymentTracker: {} as PaymentTracker,
+        }
+      ),
+      network: 'base',
+      beforePayment,
+      fetch: async () =>
+        new Response(null, {
+          status: 402,
+          headers: {
+            'PAYMENT-REQUIRED': encodePaymentRequiredHeader({
+              x402Version: 2,
+              resource: { url: 'https://seller.example/paid' },
+              accepts: [
+                {
+                  scheme: 'exact',
+                  network: 'eip155:8453',
+                  asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+                  amount: '10000',
+                  payTo: '0x209693Bc6afc0C5328bA36FaF03C514EF312287C',
+                  maxTimeoutSeconds: 60,
+                  extra: {},
+                },
+              ],
+            }),
+          },
+        }),
+    });
+
+    const response = await context.fetchWithPayment!(
+      'https://seller.example/paid'
+    );
+    expect(response.status).toBe(403);
+    expect(beforePayment).toHaveBeenCalledTimes(1);
   });
 
   it('wraps configured policies and contains fetch-wrapper initialization errors', async () => {

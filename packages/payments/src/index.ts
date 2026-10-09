@@ -84,7 +84,11 @@ export {
   type PolicyEvaluationResult,
 } from './policy';
 export { wrapBaseFetchWithPolicy } from './policy-wrapper';
-export type { PolicyWrapperOptions } from './policy-wrapper';
+export type {
+  BeforePaymentCheck,
+  BeforePaymentContext,
+  PolicyWrapperOptions,
+} from './policy-wrapper';
 export type { SIWxStorage } from './siwx-storage';
 export {
   createInMemorySIWxStorage,

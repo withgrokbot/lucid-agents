@@ -10,6 +10,18 @@ import { evaluatePolicyGroups, findMostSpecificOutgoingLimit } from './policy';
 const MAX_OUTSTANDING_ATTEMPTS = 10_000;
 const ATTEMPT_TTL_MS = 5 * 60 * 1_000;
 
+/** What a before-payment check sees: the request and the requirement about to be paid. */
+export type BeforePaymentContext = {
+  url: string;
+  method: string;
+  requirement: PaymentRequirements;
+};
+
+/** Optional async check run before a payment is reserved; `allowed: false` blocks it. */
+export type BeforePaymentCheck = (
+  context: BeforePaymentContext
+) => Promise<{ allowed: boolean; reason?: string }>;
+
 export type PolicyWrapperOptions = {
   maxOutstandingAttempts?: number;
   attemptTtlMs?: number;
@@ -17,6 +29,8 @@ export type PolicyWrapperOptions = {
   paymentRequirementSelector?: (
     requirements: readonly PaymentRequirements[]
   ) => PaymentRequirements | undefined;
+  /** Runs after the 402 is read and before any reservation; unset means no check. */
+  beforePayment?: BeforePaymentCheck;
 };
 
 type FetchLike = (
@@ -59,7 +73,11 @@ type PaymentInfo = {
 function extractPaymentInfo(
   response: Response,
   selector?: PolicyWrapperOptions['paymentRequirementSelector']
-): Pick<PaymentInfo, 'amount' | 'recipientAddress'> | undefined {
+):
+  | (Pick<PaymentInfo, 'amount' | 'recipientAddress'> & {
+      requirement: PaymentRequirements;
+    })
+  | undefined {
   const header = response.headers.get('PAYMENT-REQUIRED');
   if (!header) return undefined;
   try {
@@ -72,7 +90,7 @@ function extractPaymentInfo(
     if (!requirement) return undefined;
     const amount = BigInt(requirement.amount);
     if (amount < 0n || !requirement.payTo?.trim()) return undefined;
-    return { amount, recipientAddress: requirement.payTo };
+    return { amount, recipientAddress: requirement.payTo, requirement };
   } catch {
     return undefined;
   }
@@ -358,6 +376,27 @@ export function wrapBaseFetchWithPolicy(
       }
       const paymentAmount = paymentInfo.amount;
       const recipientAddress = paymentInfo.recipientAddress;
+
+      if (options.beforePayment) {
+        let check;
+        try {
+          check = await options.beforePayment({
+            url: urlString,
+            method: request.method,
+            requirement: paymentInfo.requirement,
+          });
+        } catch (error) {
+          check = {
+            allowed: false,
+            reason: `beforePayment check failed: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+        if (!check.allowed) {
+          return policyViolationResponse(
+            check.reason || 'Payment blocked by beforePayment check'
+          );
+        }
+      }
 
       return withAttemptLock(async () => {
         if (attemptOrder.size >= maxOutstandingAttempts) {

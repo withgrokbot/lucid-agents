@@ -218,6 +218,97 @@ describe('wrapBaseFetchWithPolicy', () => {
     expect((await wrappedFetch('https://example.com')).status).toBe(403);
   });
 
+  describe('beforePayment', () => {
+    const challenge = () =>
+      new Response(null, {
+        status: 402,
+        headers: {
+          'PAYMENT-REQUIRED': buildPaymentRequiredHeader({
+            price: '1',
+            payTo: '0x111',
+            alternates: [{ price: '2', payTo: '0x222' }],
+          }),
+        },
+      });
+
+    it('passes the selected requirement and lets an allowed payment through', async () => {
+      const seen: unknown[] = [];
+      const wrappedFetch = wrapBaseFetchWithPolicy(
+        async () => challenge(),
+        policyGroups,
+        paymentTracker,
+        rateLimiter,
+        {
+          paymentRequirementSelector: requirements => requirements[1],
+          beforePayment: async context => {
+            seen.push(context);
+            return { allowed: true };
+          },
+        }
+      );
+
+      const response = await wrappedFetch('https://example.com/paid', {
+        method: 'POST',
+      });
+      expect(response.status).toBe(402);
+      expect(seen).toEqual([
+        {
+          url: 'https://example.com/paid',
+          method: 'POST',
+          requirement: expect.objectContaining({
+            payTo: '0x222',
+            amount: '2000000',
+          }),
+        },
+      ]);
+    });
+
+    it('blocks with a policy violation before any reservation', async () => {
+      const wrappedFetch = wrapBaseFetchWithPolicy(
+        async () => challenge(),
+        policyGroups,
+        paymentTracker,
+        rateLimiter,
+        {
+          paymentRequirementSelector: requirements => requirements[0],
+          beforePayment: async () => ({
+            allowed: false,
+            reason: 'Spot-Check skip',
+          }),
+        }
+      );
+
+      const response = await wrappedFetch('https://example.com/paid');
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        error: { code: 'policy_violation', message: 'Spot-Check skip' },
+      });
+      const retry = await wrappedFetch('https://example.com/paid', paidRetry());
+      expect(retry.status).toBe(503); // no reservation was made
+    });
+
+    it('fails closed when the check throws', async () => {
+      const wrappedFetch = wrapBaseFetchWithPolicy(
+        async () => challenge(),
+        [],
+        paymentTracker,
+        undefined,
+        {
+          paymentRequirementSelector: requirements => requirements[0],
+          beforePayment: async () => {
+            throw new Error('boom');
+          },
+        }
+      );
+
+      const response = await wrappedFetch('https://example.com/paid');
+      expect(response.status).toBe(403);
+      expect((await response.json()).error.message).toBe(
+        'beforePayment check failed: boom'
+      );
+    });
+  });
+
   it('should record spending after successful payment', async () => {
     let callCount = 0;
     baseFetch = async () => {

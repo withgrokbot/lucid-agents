@@ -16,7 +16,10 @@ import {
 import { UptoEvmScheme } from '@x402/evm/upto/client';
 import type { SettleResponse } from '@x402/core/types';
 import { sanitizeAddress, ZERO_ADDRESS, type Hex } from './crypto';
-import { wrapBaseFetchWithPolicy } from './policy-wrapper';
+import {
+  wrapBaseFetchWithPolicy,
+  type BeforePaymentCheck,
+} from './policy-wrapper';
 import type { BatchSettlementBuyerOptions } from './batch-settlement';
 
 type FetchLike = (
@@ -80,6 +83,11 @@ export type RuntimePaymentOptions = {
    * cumulative vouchers after a process restart.
    */
   batchSettlement?: BatchSettlementBuyerOptions;
+  /**
+   * Optional check run before each outgoing payment (runtime wallet path); it can block the
+   * payment. Unset means no check.
+   */
+  beforePayment?: BeforePaymentCheck;
 };
 
 export type RuntimePaymentContext = {
@@ -491,13 +499,17 @@ export async function createRuntimePaymentContext(
     const policyGroups = runtime.payments?.policyGroups;
     const paymentTracker = runtime.payments?.paymentTracker;
 
-    if (policyGroups && policyGroups.length > 0 && paymentTracker) {
+    if (
+      paymentTracker &&
+      ((policyGroups && policyGroups.length > 0) || options.beforePayment)
+    ) {
       fetchWithPolicy = wrapBaseFetchWithPolicy(
         baseFetch,
-        policyGroups,
+        policyGroups ?? [],
         paymentTracker,
         undefined,
         {
+          beforePayment: options.beforePayment,
           paymentRequirementSelector: requirements =>
             requirements.find(requirement => {
               if (
