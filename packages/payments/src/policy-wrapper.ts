@@ -15,6 +15,8 @@ export type BeforePaymentContext = {
   url: string;
   method: string;
   requirement: PaymentRequirements;
+  /** The caller's abort signal, so a check can stop when the request is cancelled. */
+  signal?: AbortSignal;
 };
 
 /** Optional async check run before a payment is reserved; `allowed: false` blocks it. */
@@ -29,7 +31,7 @@ export type PolicyWrapperOptions = {
   paymentRequirementSelector?: (
     requirements: readonly PaymentRequirements[]
   ) => PaymentRequirements | undefined;
-  /** Runs after the 402 is read and before any reservation; unset means no check. */
+  /** Runs after the policy groups allow the 402 and before any reservation; unset means no check. */
   beforePayment?: BeforePaymentCheck;
 };
 
@@ -178,6 +180,61 @@ function policyViolationResponse(
  * @param rateLimiter - Limiter for enforcing rate limits
  * @returns Wrapped fetch function that enforces payment policies
  */
+/** Runs a before-payment check; returns the 403 to send when it blocks (a throw blocks too). */
+async function runBeforePayment(
+  check: BeforePaymentCheck,
+  context: BeforePaymentContext
+): Promise<Response | undefined> {
+  let result;
+  try {
+    result = await check(context);
+  } catch (error) {
+    result = {
+      allowed: false,
+      reason: `beforePayment check failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  if (result?.allowed) return undefined;
+  return policyViolationResponse(
+    result?.reason || 'Payment blocked by beforePayment check'
+  );
+}
+
+/**
+ * Applies only a before-payment check, for runtimes without a payment tracker. Unpaid 402s are
+ * checked before the outer x402 client can sign; paid retries pass through.
+ */
+export function wrapBaseFetchWithBeforePayment(
+  baseFetch: FetchLike,
+  beforePayment: BeforePaymentCheck,
+  options: Pick<PolicyWrapperOptions, 'paymentRequirementSelector'> = {}
+): FetchLike {
+  return async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    if (isPaidRequest(request)) return baseFetch(request);
+    const response = await baseFetch(request);
+    if (response.status !== 402) return response;
+    const paymentInfo = extractPaymentInfo(
+      response,
+      options.paymentRequirementSelector
+    );
+    if (!paymentInfo) {
+      return policyViolationResponse(
+        'Unable to select a valid x402 v2 payment requirement',
+        undefined,
+        503
+      );
+    }
+    const blocked = await runBeforePayment(beforePayment, {
+      url: getUrlString(request),
+      method: request.method,
+      requirement: paymentInfo.requirement,
+      signal: request.signal,
+    });
+    return blocked ?? response;
+  };
+}
+
 export function wrapBaseFetchWithPolicy(
   baseFetch: FetchLike,
   policyGroups: PaymentPolicyGroup[],
@@ -378,24 +435,42 @@ export function wrapBaseFetchWithPolicy(
       const recipientAddress = paymentInfo.recipientAddress;
 
       if (options.beforePayment) {
-        let check;
+        // Policy groups first (read-only), so a payment they reject never reaches the check. The
+        // authoritative evaluation and the reservation still run under the attempt lock below.
+        let precheck;
         try {
-          check = await options.beforePayment({
-            url: urlString,
-            method: request.method,
-            requirement: paymentInfo.requirement,
-          });
+          precheck = await evaluatePolicyGroups(
+            policyGroups,
+            paymentTracker,
+            rateLimiter,
+            urlString,
+            urlString,
+            paymentAmount,
+            recipientAddress || undefined,
+            targetDomain
+          );
         } catch (error) {
-          check = {
-            allowed: false,
-            reason: `beforePayment check failed: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        }
-        if (!check.allowed) {
           return policyViolationResponse(
-            check.reason || 'Payment blocked by beforePayment check'
+            error instanceof Error
+              ? error.message
+              : 'Payment policy storage is unavailable',
+            undefined,
+            503
           );
         }
+        if (!precheck.allowed) {
+          return policyViolationResponse(
+            precheck.reason || 'Payment blocked by policy',
+            precheck.groupName
+          );
+        }
+        const blocked = await runBeforePayment(options.beforePayment, {
+          url: urlString,
+          method: request.method,
+          requirement: paymentInfo.requirement,
+          signal: request.signal,
+        });
+        if (blocked) return blocked;
       }
 
       return withAttemptLock(async () => {

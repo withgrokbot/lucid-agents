@@ -1,7 +1,10 @@
 import { describe, expect, it, beforeEach } from 'bun:test';
 import type { PaymentPolicyGroup } from '@lucid-agents/types/payments';
 import { encodePaymentRequiredHeader } from '@x402/core/http';
-import { wrapBaseFetchWithPolicy } from '../policy-wrapper';
+import {
+  wrapBaseFetchWithBeforePayment,
+  wrapBaseFetchWithPolicy,
+} from '../policy-wrapper';
 import { createPaymentTracker } from '../payment-tracker';
 import { createInMemoryPaymentStorage } from '../in-memory-payment-storage';
 import type { PaymentStorage } from '../payment-storage';
@@ -259,6 +262,7 @@ describe('wrapBaseFetchWithPolicy', () => {
             payTo: '0x222',
             amount: '2000000',
           }),
+          signal: expect.any(AbortSignal),
         },
       ]);
     });
@@ -285,6 +289,81 @@ describe('wrapBaseFetchWithPolicy', () => {
       });
       const retry = await wrappedFetch('https://example.com/paid', paidRetry());
       expect(retry.status).toBe(503); // no reservation was made
+    });
+
+    it('does not run the check when the policy groups already reject the payment', async () => {
+      let calls = 0;
+      const wrappedFetch = wrapBaseFetchWithPolicy(
+        async () =>
+          new Response(null, {
+            status: 402,
+            headers: {
+              'PAYMENT-REQUIRED': buildPaymentRequiredHeader({
+                price: '50',
+                payTo: '0x111',
+              }),
+            },
+          }),
+        policyGroups, // maxPaymentUsd 10
+        paymentTracker,
+        rateLimiter,
+        {
+          paymentRequirementSelector: requirements => requirements[0],
+          beforePayment: async () => {
+            calls++;
+            return { allowed: true };
+          },
+        }
+      );
+
+      const response = await wrappedFetch('https://example.com/paid');
+      expect(response.status).toBe(403);
+      expect(calls).toBe(0);
+    });
+
+    it("passes the caller's abort signal to the check", async () => {
+      const controller = new AbortController();
+      let seen: AbortSignal | undefined;
+      const wrappedFetch = wrapBaseFetchWithPolicy(
+        async () => challenge(),
+        [],
+        paymentTracker,
+        undefined,
+        {
+          paymentRequirementSelector: requirements => requirements[0],
+          beforePayment: async ({ signal }) => {
+            seen = signal;
+            return { allowed: true };
+          },
+        }
+      );
+
+      await wrappedFetch('https://example.com/paid', {
+        signal: controller.signal,
+      });
+      controller.abort();
+      expect(seen?.aborted).toBe(true);
+    });
+
+    it('wrapBaseFetchWithBeforePayment checks unpaid 402s and passes paid retries through', async () => {
+      let calls = 0;
+      const wrappedFetch = wrapBaseFetchWithBeforePayment(
+        async request =>
+          (request as Request).headers.get('PAYMENT-SIGNATURE')
+            ? new Response('paid')
+            : challenge(),
+        async () => {
+          calls++;
+          return { allowed: false, reason: 'blocked' };
+        },
+        { paymentRequirementSelector: requirements => requirements[0] }
+      );
+
+      expect((await wrappedFetch('https://example.com/paid')).status).toBe(403);
+      expect(calls).toBe(1);
+      const retry = await wrappedFetch('https://example.com/paid', paidRetry());
+      expect(await retry.text()).toBe('paid');
+      expect(calls).toBe(1);
     });
 
     it('fails closed when the check throws', async () => {

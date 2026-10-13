@@ -83,7 +83,10 @@ export {
   findMostSpecificIncomingLimit,
   type PolicyEvaluationResult,
 } from './policy';
-export { wrapBaseFetchWithPolicy } from './policy-wrapper';
+export {
+  wrapBaseFetchWithBeforePayment,
+  wrapBaseFetchWithPolicy,
+} from './policy-wrapper';
 export type {
   BeforePaymentCheck,
   BeforePaymentContext,

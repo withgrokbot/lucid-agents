@@ -314,6 +314,31 @@ describe('runtime payment client context', () => {
     expect(beforePayment).toHaveBeenCalledTimes(1);
   });
 
+  it('applies beforePayment when the runtime has a wallet but no payments tracker', async () => {
+    const beforePayment = mock(async () => ({
+      allowed: false,
+      reason: 'blocked',
+    }));
+    let signedRequests = 0;
+    const context = await createRuntimePaymentContext({
+      runtime: runtimeWithConnector({}),
+      network: 'base-sepolia',
+      beforePayment,
+      fetch: async (input, init) => {
+        const request = new Request(input as RequestInfo, init);
+        if (request.headers.get('PAYMENT-SIGNATURE')) signedRequests++;
+        return paymentRequired('10000');
+      },
+    });
+
+    const response = await context.fetchWithPayment!(
+      'https://seller.example/paid'
+    );
+    expect(response.status).toBe(403);
+    expect(beforePayment).toHaveBeenCalledTimes(1);
+    expect(signedRequests).toBe(0);
+  });
+
   it('wraps configured policies and contains fetch-wrapper initialization errors', async () => {
     const tracker = {} as PaymentTracker;
     const payments = {

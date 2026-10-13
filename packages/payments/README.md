@@ -411,10 +411,14 @@ rate counter beside its atomic storage reservations.
 ### Before-payment checks
 
 `beforePayment` is an optional async check that runs for each outgoing 402,
-after the policy groups allow it and before any reservation or signature. It
-receives the request URL, method, and the selected requirement, and blocks with
-a `policy_violation` 403 when it returns `allowed: false` (or throws). It is off
-when unset. `wrapBaseFetchWithPolicy()` accepts the same option.
+after the policy groups allow it and before any reservation or signature. A
+payment the groups reject never reaches the check. It receives the request URL,
+method, the selected requirement and the caller's abort `signal`. It blocks with
+a `policy_violation` 403 when it returns `allowed: false` or throws, so a check
+that should fail open must catch its own errors. It is off when unset, and it
+also applies when the runtime has a wallet but no payments tracker.
+`wrapBaseFetchWithPolicy()` accepts the same option;
+`wrapBaseFetchWithBeforePayment()` applies the check alone.
 
 ```ts
 import { createRuntimePaymentContext } from '@lucid-agents/payments';
@@ -429,30 +433,38 @@ const { fetchWithPayment } = await createRuntimePaymentContext({
 ```
 
 Optional third-party example: ask
-[x402 Endpoint Spot-Check](https://github.com/withgrokbot/x402-spotcheck), a
-service not affiliated with Lucid Agents, about the endpoint before paying. It
-probes the endpoint without paying it. This example blocks unless the verdict
-is `pay`, and lets the payment proceed when Spot-Check returns no verdict.
+[402xAgent](https://github.com/withgrokbot/x402-spotcheck), a service not
+affiliated with Lucid Agents, whether the endpoint's live 402 matches its
+listing. It probes the endpoint without paying it. The example waits at most
+1.5 s and stops when the caller cancels. It blocks only on a `skip` with a
+known reason code; a timeout, an error, a non-200, a `{}` or unreadable answer,
+`recheck` or an unknown code all let the payment proceed.
 
 ```ts
-const SPOT_CHECK =
-  'https://verified-catalog-lookup.withgrokbot.workers.dev/v1/products/endpoint-spot-check';
+import type { BeforePaymentCheck } from '@lucid-agents/payments';
 
-const beforePayment = async ({
-  url,
-  method,
-}: {
-  url: string;
-  method: string;
-}) => {
-  const probe = method === 'POST' ? 'POST' : 'GET';
-  const query = new URLSearchParams({ url, method: probe, ref: 'via-lucid' });
-  const res = await fetch(`${SPOT_CHECK}?${query}`).catch(() => null);
-  if (res?.status !== 200) return { allowed: true }; // no verdict: fail open
-  const { verdict, reason } = await res.json();
-  return verdict === 'pay'
-    ? { allowed: true }
-    : { allowed: false, reason: `Spot-Check ${verdict}: ${reason}` };
+const CHECK = 'https://api.402xagent.com/v1/products/endpoint-spot-check';
+const SKIP_CODES = new Set([
+  'price_mismatch', 'pay_to_mismatch', 'network_mismatch', 'asset_not_usdc',
+  'network_unsupported', 'ssrf_blocked', 'bad_challenge', 'ambiguous',
+]);
+
+const beforePayment: BeforePaymentCheck = async ({ url, method, signal }) => {
+  const query = new URLSearchParams({ url });
+  if (method === 'POST') query.set('method', 'POST');
+  const timeout = AbortSignal.timeout(1_500);
+  try {
+    const res = await fetch(`${CHECK}?${query}`, {
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+    if (!res.ok) return { allowed: true }; // no verdict: fail open
+    const body = await res.json().catch(() => ({})); // unreadable: fail open
+    return body?.verdict === 'skip' && SKIP_CODES.has(body.reason_code)
+      ? { allowed: false, reason: `402xAgent skip: ${body.reason_code}` }
+      : { allowed: true };
+  } catch {
+    return { allowed: true }; // timeout, cancel or network error: fail open
+  }
 };
 ```
 
