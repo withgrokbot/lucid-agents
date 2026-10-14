@@ -366,6 +366,99 @@ describe('wrapBaseFetchWithPolicy', () => {
       expect(calls).toBe(1);
     });
 
+    it('wrapBaseFetchWithBeforePayment preserves a Request input without init', async () => {
+      const controller = new AbortController();
+      let seen: Request | undefined;
+      let checkedMethod: string | undefined;
+      let checkedSignal: AbortSignal | undefined;
+      const wrappedFetch = wrapBaseFetchWithBeforePayment(
+        async request => {
+          seen = request as Request;
+          return new Response('ok');
+        },
+        async ctx => {
+          checkedMethod = ctx.method;
+          checkedSignal = ctx.signal;
+          return { allowed: true };
+        }
+      );
+      const input = new Request('https://example.com/paid', {
+        method: 'POST',
+        headers: { 'X-Test': 'a', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hello: 'world' }),
+        signal: controller.signal,
+      });
+      const response = await wrappedFetch(input);
+      expect(await response.text()).toBe('ok');
+      expect(seen).toBe(input);
+      expect(seen!.method).toBe('POST');
+      expect(seen!.headers.get('X-Test')).toBe('a');
+      expect(await seen!.text()).toBe('{"hello":"world"}');
+      controller.abort();
+      expect(seen!.signal.aborted).toBe(true);
+      expect(checkedMethod).toBeUndefined();
+      expect(checkedSignal).toBeUndefined();
+    });
+
+    it('wrapBaseFetchWithBeforePayment merges init over a Request input', async () => {
+      const original = new AbortController();
+      const override = new AbortController();
+      let seen: Request | undefined;
+      let checkedMethod: string | undefined;
+      let checkedSignal: AbortSignal | undefined;
+      const wrappedFetch = wrapBaseFetchWithBeforePayment(
+        async request => {
+          seen = request as Request;
+          return challenge();
+        },
+        async ctx => {
+          checkedMethod = ctx.method;
+          checkedSignal = ctx.signal;
+          return { allowed: true };
+        },
+        { paymentRequirementSelector: requirements => requirements[0] }
+      );
+      const input = new Request('https://example.com/paid', {
+        method: 'POST',
+        headers: { 'X-Test': 'a' },
+        body: 'original-body',
+        signal: original.signal,
+      });
+      const response = await wrappedFetch(input, {
+        method: 'PUT',
+        headers: { 'X-Test': 'b' },
+        body: 'override-body',
+        signal: override.signal,
+      });
+      expect(response.status).toBe(402);
+      expect(seen!.method).toBe('PUT');
+      expect(seen!.headers.get('X-Test')).toBe('b');
+      expect(await seen!.text()).toBe('override-body');
+      expect(checkedMethod).toBe('PUT');
+      override.abort();
+      expect(seen!.signal.aborted).toBe(true);
+      expect(checkedSignal!.aborted).toBe(true);
+    });
+
+    it('wrapBaseFetchWithBeforePayment keeps Request body when init only adds headers', async () => {
+      let seen: Request | undefined;
+      const wrappedFetch = wrapBaseFetchWithBeforePayment(
+        async request => {
+          seen = request as Request;
+          return new Response('ok');
+        },
+        async () => ({ allowed: true })
+      );
+      const input = new Request('https://example.com/paid', {
+        method: 'POST',
+        body: 'keep-me',
+      });
+      await wrappedFetch(input, { headers: { 'X-Extra': '1' } });
+      expect(seen!.method).toBe('POST');
+      expect(seen!.headers.get('X-Extra')).toBe('1');
+      expect(await seen!.text()).toBe('keep-me');
+    });
+
     it('fails closed when the check throws', async () => {
       const wrappedFetch = wrapBaseFetchWithPolicy(
         async () => challenge(),

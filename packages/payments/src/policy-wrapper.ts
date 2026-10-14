@@ -204,13 +204,23 @@ async function runBeforePayment(
  * Applies only a before-payment check, for runtimes without a payment tracker. Unpaid 402s are
  * checked before the outer x402 client can sign; paid retries pass through.
  */
+/**
+ * Normalize fetch arguments into a single Request without losing data.
+ * A Request input with no init is passed through untouched (its body is not
+ * read or cloned); otherwise init is merged over it via new Request(input, init).
+ */
+function toRequest(input: RequestInfo | URL, init?: RequestInit): Request {
+  if (input instanceof Request && init === undefined) return input;
+  return new Request(input, init);
+}
+
 export function wrapBaseFetchWithBeforePayment(
   baseFetch: FetchLike,
   beforePayment: BeforePaymentCheck,
   options: Pick<PolicyWrapperOptions, 'paymentRequirementSelector'> = {}
 ): FetchLike {
   return async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = input instanceof Request ? input : new Request(input, init);
+    const request = toRequest(input, init);
     if (isPaidRequest(request)) return baseFetch(request);
     const response = await baseFetch(request);
     if (response.status !== 402) return response;
@@ -351,7 +361,7 @@ export function wrapBaseFetchWithPolicy(
     withAttemptLock(() => dequeueAttempt(requestKey));
 
   return async (input: RequestInfo | URL, init?: RequestInit) => {
-    const request = input instanceof Request ? input : new Request(input, init);
+    const request = toRequest(input, init);
     const urlString = getUrlString(request);
     const targetUrl = urlString;
     const endpointUrl = urlString;
